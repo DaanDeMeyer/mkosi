@@ -10,7 +10,6 @@
 /SHA256SUMS.gpg
 /build
 /dist
-/mkosi.build
 /mkosi.egg-info
 /mkosi.extra
 /mkosi.nspawn

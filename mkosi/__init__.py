@@ -1256,8 +1256,8 @@ def mount_image(args: CommandLineArguments,
             # likely because a stale device is leftover somewhere from the previous run. To fix this, we make
             # sure to always clean up stale devices after unmounting the image by running the following
             # command.
-            if args.output_format == OutputFormat.gpt_btrfs:
-                run(["btrfs", "device", "scan", "-u"])
+            # if args.output_format == OutputFormat.gpt_btrfs:
+            #     run(["btrfs", "device", "scan", "-u"])
 
 
 @completestep("Assigning hostname")
