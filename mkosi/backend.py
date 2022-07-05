@@ -322,7 +322,7 @@ class PartitionTable:
     sector_size: int = 512
     first_lba: Optional[int] = None
 
-    grain: int = 4096
+    grain: int = 1024 ** 2
 
     def first_partition_offset(self, max_partitions: int = 128) -> int:
         if self.first_lba is not None:
@@ -392,7 +392,6 @@ class PartitionTable:
 
     def sfdisk_spec(self) -> str:
         table = ["label: gpt",
-                 f"grain: {self.grain}",
                  f"first-lba: {self.first_partition_offset() // self.sector_size}",
                  *(p.sfdisk_spec() for p in self.partitions.values())]
         return '\n'.join(table)
