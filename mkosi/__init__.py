@@ -3916,6 +3916,46 @@ def extract_partition(
     return f
 
 
+# Adapted from https://github.com/torvalds/linux/blob/master/scripts/extract-vmlinux
+def extract_vmlinux(root: Path, vmlinuz: Path) -> Path:
+    vmlinux = Path(vmlinuz.parent / "vmlinux")
+
+    if root.joinpath(vmlinux).exists():
+        return vmlinux
+
+    content = root.joinpath(vmlinuz).read_bytes()
+
+    data = [
+        ["zstd",  r"(\265/\375",   "xxx",   ["unzstd"]],
+        ["gzip",  r"\037\213\010", "xy",    ["gunzip"]],
+        ["xz",    r"\3757zXZ\000", "abcde", ["unxz"]],
+        ["bzip2", r"BZh",          "xy",    ["bunzip2"]],
+        ["lzma",  r"\135\0\0\0",   "xxx",   ["unlzma"]],
+        ["lzop",  r"\211\114\132", "xy",    ["lzop", "-d"]],
+        ["lz4",   r"\002!L\030",   "xxx",   ["lz4", "-d"]],
+    ]
+
+    for algorithm, magic1, magic2, decompress in data:
+        if not shutil.which(decompress[0]):
+            MkosiPrinter.info(f"Missing {decompress[0]} on the host, can't check if {vmlinuz} is compressed with {algorithm}")
+            continue
+
+        tr = run(["tr", fr"{magic1}\n{magic2}", fr"\n{magic2}="], input=content, stdout=PIPE)
+        grep = run(["grep", "-abo", f"^{magic2}"], input=tr.stdout, stdout=PIPE, check=False)
+        if grep.returncode > 1:
+            die(f"grep failed with abnormal error code: {grep.returncode}")
+
+        for line in grep.stdout.decode().splitlines():
+            pos = int(line.split(":")[0])
+            run(decompress, input=content[pos-1:], stdout=root.joinpath(vmlinux).open("wb"), stderr=DEVNULL, check=False)
+            readelf = run(["readelf", "-h", root / vmlinux], stdout=DEVNULL, stderr=DEVNULL, check=False)
+            if readelf.returncode == 0:
+                MkosiPrinter.info(f"Extracted vmlinux from {vmlinuz} compressed with {algorithm}")
+                return vmlinux
+
+    die(f"Could not extract vmlinux from {vmlinuz}")
+
+
 def gen_kernel_images(args: MkosiArgs, root: Path) -> Iterator[Tuple[str, Path]]:
     # Apparently openmandriva hasn't yet completed its usrmerge so we use lib here instead of usr/lib.
     for kver in root.joinpath("lib/modules").iterdir():
@@ -3932,6 +3972,8 @@ def gen_kernel_images(args: MkosiArgs, root: Path) -> Iterator[Tuple[str, Path]]
             kimg = Path(f"boot/vmlinuz-{kver.name}")
         else:
             kimg = Path("lib/modules") / kver.name / "vmlinuz"
+
+        kimg = extract_vmlinux(root, kimg)
 
         yield kver.name, kimg
 
