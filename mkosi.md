@@ -1597,7 +1597,7 @@ in addition to `apt` and `debootstrap`, depending on what kind of distribution i
 you want to build. `debootstrap` on Debian only pulls in the Debian keyring
 on its own, and the version on Ubuntu only the one from Ubuntu.
 
-Note that the minimum required Python version is 3.7.
+Note that the minimum required Python version is 3.9.
 
 # REFERENCES
 * [Primary mkosi git repository on GitHub](https://github.com/systemd/mkosi/)
