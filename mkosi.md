@@ -689,6 +689,13 @@ a boolean argument: either "1", "yes", or "true" to enable, or "0",
   listed variables will be set. If the same variable is set twice, the
   later setting overrides the earlier one.
 
+`Mounts=`, `--mount=`
+
+: Adds bind mounts to the environment that the
+  build/prepare/postinstall/finalize scripts are executed with. Takes
+  a space-separated list of `SRC:DST` mounts. This option may be
+  specified more than once, in which case all listed mounts are added.
+
 `BuildSources=`, `--build-sources=`
 
 : Takes a path to a source tree to mount into the development image, if

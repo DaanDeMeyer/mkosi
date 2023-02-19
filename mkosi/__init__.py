@@ -74,6 +74,7 @@ from mkosi.run import (
     run,
     run_workspace_command,
     spawn,
+    acl_toggle_remove,
 )
 from mkosi.types import PathString
 
@@ -1014,24 +1015,6 @@ def calculate_bmap(state: MkosiState) -> None:
         run(cmdline)
 
 
-def acl_toggle_remove(root: Path, uid: int, *, allow: bool) -> None:
-    ret = run(
-        [
-            "setfacl",
-            "--physical",
-            "--modify" if allow else "--remove",
-            f"user:{uid}:rwx" if allow else f"user:{uid}",
-            "-",
-        ],
-        check=False,
-        text=True,
-        # Supply files via stdin so we don't clutter --debug run output too much
-        input="\n".join([str(root), *(e.path for e in cast(Iterator[os.DirEntry[str]], scandir_recursive(root)) if e.is_dir())])
-    )
-    if ret.returncode != 0:
-        warn("Failed to set ACLs, you'll need root privileges to remove some generated files/directories")
-
-
 def save_cache(state: MkosiState) -> None:
     cache = cache_tree_path(state.config, is_final_image=False) if state.do_run_build_script else cache_tree_path(state.config, is_final_image=True)
 
@@ -1859,6 +1842,14 @@ def create_parser() -> ArgumentParserMkosi:
         type=Path,
         metavar="PATH",
     )
+    group.add_argument(
+        "--mount",
+        action=SpaceDelimitedListAction,
+        dest="mounts",
+        default=[],
+        help="Add a bind mount when running scripts",
+        metavar="SRC:DST",
+    )
 
     group = parser.add_argument_group("Partitions options")
     group.add_argument('--base-image',
@@ -2585,12 +2576,27 @@ def load_args(args: argparse.Namespace) -> MkosiConfig:
     if args.environment:
         env = {}
         for s in args.environment:
-            key, _, value = s.partition("=")
+            key, sep, value = s.partition("=")
+            if not sep:
+                die(f"Environment variable {s} is not in the format NAME=VALUE")
             value = value or os.getenv(key, "")
             env[key] = value
         args.environment = env
     else:
         args.environment = {}
+
+    if args.mounts:
+        mounts = []
+        for m in args.mounts:
+            src, sep, dst = m.partition(":")
+            if not sep:
+                die(f"Bind mount {m} is not in the format SRC:DST")
+            if not dst:
+                dst = src
+            mounts.append((Path(src), Path(dst)))
+        args.mounts = mounts
+    else:
+        args.mounts = []
 
     if args.credentials:
         credentials = default_credentials()

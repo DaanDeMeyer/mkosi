@@ -287,6 +287,7 @@ class MkosiConfig:
     clean_package_metadata: Union[bool, str]
     remove_files: list[Path]
     environment: dict[str, str]
+    mounts: list[tuple[Path, Path]]
     build_sources: Path
     build_dir: Optional[Path]
     install_dir: Optional[Path]

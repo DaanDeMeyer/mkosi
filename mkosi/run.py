@@ -14,7 +14,7 @@ from types import TracebackType
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Type, TypeVar
 
 from mkosi.backend import MkosiState
-from mkosi.log import ARG_DEBUG, MkosiPrinter, die
+from mkosi.log import ARG_DEBUG, MkosiPrinter, die, warn
 from mkosi.types import _FILE, CompletedProcess, PathString, Popen
 
 CLONE_NEWNS = 0x00020000
@@ -314,6 +314,9 @@ def run_workspace_command(
     else:
         cmdline += ["--unshare-net"]
 
+    for src, dst in state.config.mounts:
+        cmdline += ["--bind", src, dst]
+
     cmdline += ["sh", "-c"]
 
     env = dict(
@@ -332,5 +335,26 @@ def run_workspace_command(
             run([*cmdline, template.format("sh")], check=False, env=env)
         die(f"\"{shlex.join(str(s) for s in cmd)}\" returned non-zero exit code {e.returncode}.")
     finally:
+        for src, _ in state.config.mounts:
+            acl_toggle_remove(src, state.uid, allow=True)
+
         if state.workspace.joinpath("resolv.conf").is_symlink():
             shutil.move(state.workspace.joinpath("resolv.conf"), resolve)
+
+
+def acl_toggle_remove(root: Path, uid: int, *, allow: bool) -> None:
+    ret = run(
+        [
+            "setfacl",
+            "--physical",
+            "--modify" if allow else "--remove",
+            f"user:{uid}:rwx" if allow else f"user:{uid}",
+            "-",
+        ],
+        check=False,
+        text=True,
+        # Supply files via stdin so we don't clutter --debug run output too much
+        input="\n".join([str(root), *(os.fspath(e) for e in root.rglob("*") if e.is_dir())])
+    )
+    if ret.returncode != 0:
+        warn("Failed to set ACLs, you'll need root privileges to remove some generated files/directories")
