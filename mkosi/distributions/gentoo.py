@@ -1,67 +1,211 @@
 # SPDX-License-Identifier: LGPL-2.1+
 
 import os
-import re
-import urllib.parse
-import urllib.request
+import subprocess
+import secrets
+import textwrap
+import tempfile
+import sys
 from collections.abc import Sequence
-from pathlib import Path
 
-from mkosi.archive import extract_tar
 from mkosi.config import Architecture
 from mkosi.context import Context
 from mkosi.distributions import (
     Distribution,
     DistributionInstaller,
     PackageType,
-    join_mirror,
 )
-from mkosi.log import ARG_DEBUG, complete_step, die
+from mkosi.log import ARG_DEBUG, die
 from mkosi.run import run
-from mkosi.sandbox import apivfs_cmd, chroot_cmd
-from mkosi.tree import copy_tree, rmtree
-from mkosi.types import PathString
-from mkosi.util import sort_packages
+from mkosi.sandbox import apivfs_cmd, finalize_crypto_mounts
+from mkosi.util import INVOKING_USER, sort_packages, umask
+
+
+def setup_keyring(context: Context) -> None:
+    gpgdir = context.pkgmngr / "etc/portage/gnupg"
+
+    with umask(~0o700):
+        gpgdir.mkdir(exist_ok=True, parents=True)
+
+    pw = secrets.token_hex(32)
+
+    env = dict(GNUPGHOME=os.fspath(gpgdir))
+    if sys.stderr.isatty():
+        env |= dict(GPG_TTY=os.ttyname(sys.stderr.fileno()))
+
+    with tempfile.NamedTemporaryFile(mode="w") as f:
+        f.write(
+            textwrap.dedent(
+                f"""\
+                %echo Generating Portage local OpenPGP trust key
+                Key-Type: RSA
+                Key-Length: 3072
+                Subkey-Type: RSA
+                Subkey-Length: 3072
+                Name-Real: Portage Local Trust Key
+                Name-Comment: local signing only
+                Name-Email: portage@localhost
+                Expire-Date: 0
+                Passphrase: {pw}
+                %commit
+                %echo done
+                """
+            )
+        )
+        f.flush()
+
+        run(["gpg", "--batch", "--generate-key", f.name], env=env)
+
+    with umask(~0o600):
+        passphrase = (context.pkgmngr / "etc/portage/gnupg/pass")
+        passphrase.write_text(pw)
+
+    primary = run(
+        [
+            "gpg",
+            "--batch",
+            "--list-secret-keys",
+            "--keyid-format=long",
+            "--with-colons",
+        ],
+        stdout=subprocess.PIPE,
+        env=env,
+    ).stdout.strip().splitlines()[0].removeprefix("fpr").strip(":")
+
+    keyring = run(["curl", "https://qa-reports.gentoo.org/output/service-keys.gpg"], stdout=subprocess.PIPE, text=False).stdout
+    run(["gpg", "--batch", "--import"], input=keyring, text=False, env=env)
+
+    keys = run(
+        [
+            "gpg",
+            "--batch",
+            "--list-keys",
+            "--keyid-format=long",
+            "--with-colons",
+        ],
+        stdout=subprocess.PIPE,
+        env=env,
+    ).stdout.strip().splitlines()
+
+    keys = [key.removeprefix("fpr").strip(":") for key in keys if key.startswith("fpr")]
+    keys = [key for key in keys if key != primary]
+
+    for key in keys:
+        run(
+            [
+                "gpg",
+                "--command-fd=0",
+                "--yes",
+                "--no-tty",
+                "--passphrase-file", passphrase,
+                "--pinentry-mode=loopback",
+                "--lsign-key", key,
+            ],
+            env=env,
+            input="y\ny\n",
+        )
+
+    run(["gpg", "--batch", "--check-trustdb"], env=env)
+
+
+def setup_emerge(context: Context) -> None:
+    setup_keyring(context)
+    # Set up a basic profile to trick emerge into proceeding (we don't care about the profile since we're
+    # only installing binary packages). See https://bugs.gentoo.org/470006.
+    make_profile = context.pkgmngr / "etc/portage/make.profile"
+    make_profile.mkdir(parents=True, exist_ok=True)
+    (make_profile / "make.defaults").write_text(
+        textwrap.dedent(
+            f"""\
+            ARCH="{context.config.distribution.architecture(context.config.architecture)}"
+            ACCEPT_KEYWORDS="**"
+            PORTAGE_USERNAME="root"
+            PORTAGE_GRPNAME="root"
+            PORTAGE_TMPDIR="/var/tmp"
+            PORTDIR="{context.cache_dir}"
+            PKGDIR="{context.cache_dir / "cache/binpkgs"}"
+            GPG_VERIFY_USER_DROP=""
+            GPG_VERIFY_GROUP_DROP=""
+            BINPKG_FORMAT="gpkg"
+            """
+        )
+    )
+    (make_profile / "parent").write_text("/var/empty")
+    (make_profile / "use.force").write_text("-split-usr")
+
+    features = " ".join([
+        # Disable sandboxing in emerge because we already do it in mkosi.
+        "-sandbox",
+        "-pid-sandbox",
+        "-ipc-sandbox",
+        "-network-sandbox",
+        "-userfetch",
+        "-userpriv",
+        "-usersandbox",
+        "-usersync",
+        "-ebuild-locks",
+        "parallel-fetch",
+        "parallel-install",
+        *(["noman", "nodoc", "noinfo"] if context.config.with_docs else []),
+    ])
+
+    # Setting FEATURES via the environment variable does not seem to apply to ebuilds in portage, so we
+    # append to /etc/portage/make.conf instead.
+    with (context.pkgmngr / "etc/portage/make.conf").open("a") as f:
+        f.write(f"\nFEATURES=\"${{FEATURES}} {features}\"\n")
+
+    mirror = context.config.mirror or "https://distfiles.gentoo.org"
+
+    (context.pkgmngr / "etc/portage/binrepos.conf").write_text(
+        textwrap.dedent(
+            f"""\
+            [binhost]
+            sync-uri = {mirror}/releases/amd64/binpackages/17.1/x86-64/
+            priority = 10
+            """
+        )
+    )
 
 
 def invoke_emerge(context: Context, packages: Sequence[str] = (), apivfs: bool = True) -> None:
     run(
-        apivfs_cmd(context.root, tools=context.config.tools()) + [
-            # We can't mount the stage 3 /usr using `options`, because bwrap isn't available in the stage 3
-            # tarball which is required by apivfs_cmd(), so we have to mount /usr from the tarball later
-            # using another bwrap exec.
-            "bwrap",
-            "--dev-bind", "/", "/",
-            "--bind", context.cache_dir / "stage3/usr", "/usr",
+        [
             "emerge",
-            "--buildpkg=y",
-            "--usepkg=y",
+            "--tree",
+            "--usepkgonly=y",
             "--getbinpkg=y",
-            "--binpkg-respect-use=y",
             "--jobs",
             "--load-average",
             "--root-deps=rdeps",
             "--with-bdeps=n",
             "--verbose-conflicts",
             "--noreplace",
-            *(["--verbose", "--quiet=n", "--quiet-fail=n"] if ARG_DEBUG.get() else ["--quiet-build", "--quiet"]),
-            f"--root={context.root}",
+            *(["--verbose"] if ARG_DEBUG.get() else ["--quiet-build", "--quiet"]),
             *sort_packages(packages),
         ],
-        sandbox=context.sandbox(
-            network=True,
-            options=[
-                # TODO: Get rid of as many of these as possible.
-                "--bind", context.cache_dir / "stage3/etc", "/etc",
-                "--bind", context.cache_dir / "stage3/var", "/var",
-                "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
-                "--bind", context.cache_dir / "repos", "/var/db/repos",
-            ],
-        ),
         env=dict(
-            PKGDIR=str(context.cache_dir / "binpkgs"),
-            DISTDIR=str(context.cache_dir / "distfiles"),
-        ) | ({"USE": "build"} if not apivfs else {}) | context.config.environment,
+            PORTAGE_REPOSITORIES="",
+            ROOT=os.fspath(context.root),
+            BROOT=os.fspath(context.root),
+            SYSROOT=os.fspath(context.root),
+            USE="-split-usr",
+        ) | context.config.environment,
+        sandbox=(
+            context.sandbox(
+                network=True,
+                options=[
+                    "--dir", "/var/empty",
+                    "--bind", context.root, context.root,
+                    "--bind", context.cache_dir, context.cache_dir,
+                    "--bind", INVOKING_USER.home() / ".local", INVOKING_USER.home() / ".local",
+                    *finalize_crypto_mounts(tools=context.config.tools()),
+                ],
+            ) + [
+                "sh",
+                "-c",
+                f"mount -t overlay -o lowerdir={INVOKING_USER.home() / '.local'}:/usr overlayfs /usr && exec $0 \"$@\"",
+            ] + (apivfs_cmd(context.root, tools=context.config.tools()) if apivfs else [])
+        ),
     )
 
 
@@ -88,86 +232,19 @@ class Installer(DistributionInstaller):
 
     @classmethod
     def setup(cls, context: Context) -> None:
-        pass
+        setup_emerge(context)
 
     @classmethod
     def install(cls, context: Context) -> None:
-        arch = context.config.distribution.architecture(context.config.architecture)
+        # First, we set up merged usr.
+        # This list is taken from https://salsa.debian.org/installer-team/debootstrap/-/blob/master/functions#L1369.
 
-        mirror = context.config.mirror or "https://distfiles.gentoo.org"
-        # http://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3.txt
-        stage3tsf_path_url = join_mirror(
-            mirror.partition(" ")[0],
-            f"releases/{arch}/autobuilds/latest-stage3.txt",
-        )
+        with umask(~0o755):
+            for d in ("bin", "sbin", "lib", "lib64"):
+                (context.root / d).symlink_to(f"usr/{d}")
+                (context.root / f"usr/{d}").mkdir(parents=True, exist_ok=True)
 
-        with urllib.request.urlopen(stage3tsf_path_url) as r:
-            # e.g.: 20230108T161708Z/stage3-amd64-nomultilib-systemd-mergedusr-20230108T161708Z.tar.xz
-            regexp = rf"^[0-9]+T[0-9]+Z/stage3-{arch}-llvm-systemd-mergedusr-[0-9]+T[0-9]+Z\.tar\.xz"
-            all_lines = r.readlines()
-            for line in all_lines:
-                if (m := re.match(regexp, line.decode("utf-8"))):
-                    stage3_latest = Path(m.group(0))
-                    break
-            else:
-                die("profile names changed upstream?")
-
-        stage3_url = join_mirror(mirror, f"releases/{arch}/autobuilds/{stage3_latest}")
-        stage3_tar = context.cache_dir / "stage3.tar"
-        stage3 = context.cache_dir / "stage3"
-
-        with complete_step("Fetching latest stage3 snapshot"):
-            old = stage3_tar.stat().st_mtime if stage3_tar.exists() else 0
-
-            cmd: list[PathString] = ["curl", "-L", "--progress-bar", "-o", stage3_tar, stage3_url]
-            if stage3_tar.exists():
-                cmd += ["--time-cond", stage3_tar]
-
-            run(cmd, sandbox=context.sandbox())
-
-            if stage3_tar.stat().st_mtime > old:
-                rmtree(stage3)
-
-        stage3.mkdir(exist_ok=True)
-
-        if not any(stage3.iterdir()):
-            with complete_step(f"Extracting {stage3_tar.name} to {stage3}"):
-                extract_tar(context, stage3_tar, stage3)
-
-        for d in ("binpkgs", "distfiles", "repos/gentoo"):
-            (context.cache_dir / d).mkdir(parents=True, exist_ok=True)
-
-        copy_tree(context.pkgmngr, stage3, preserve=False, use_subvolumes=context.config.use_subvolumes)
-
-        features = " ".join([
-            # Disable sandboxing in emerge because we already do it in mkosi.
-            "-sandbox",
-            "-pid-sandbox",
-            "-ipc-sandbox",
-            "-network-sandbox",
-            "-userfetch",
-            "-userpriv",
-            "-usersandbox",
-            "-usersync",
-            "-ebuild-locks",
-            "parallel-install",
-            *(["noman", "nodoc", "noinfo"] if context.config.with_docs else []),
-        ])
-
-        # Setting FEATURES via the environment variable does not seem to apply to ebuilds in portage, so we
-        # append to /etc/portage/make.conf instead.
-        with (stage3 / "etc/portage/make.conf").open("a") as f:
-            f.write(f"\nFEATURES=\"${{FEATURES}} {features}\"\n")
-
-        chroot = chroot_cmd(
-            stage3,
-            tools=context.config.tools(),
-            options=["--bind", context.cache_dir / "repos", "/var/db/repos"],
-        )
-
-        run(chroot + ["emerge-webrsync"], sandbox=context.sandbox(network=True))
-
-        invoke_emerge(context, packages=["sys-apps/baselayout"], apivfs=False)
+        cls.install_packages(context, packages=["sys-apps/baselayout"], apivfs=False)
 
     @classmethod
     def install_packages(cls, context: Context, packages: Sequence[str], apivfs: bool = True) -> None:

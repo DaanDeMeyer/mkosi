@@ -3388,7 +3388,7 @@ def run_clean(args: Args, config: Config) -> None:
                     *(
                         config.cache_dir / p / d
                         for p in ("cache", "lib")
-                        for d in ("apt", "dnf", "libdnf5", "pacman", "zypp")
+                        for d in ("apt", "dnf", "libdnf5", "pacman", "zypp", "binpkgs")
                     ),
                 )
 
