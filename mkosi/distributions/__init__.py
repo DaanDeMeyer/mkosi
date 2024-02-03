@@ -93,6 +93,7 @@ class Distribution(StrEnum):
     rocky        = enum.auto()
     alma         = enum.auto()
     custom       = enum.auto()
+    amazon       = enum.auto()
 
     def is_centos_variant(self) -> bool:
         return self in (

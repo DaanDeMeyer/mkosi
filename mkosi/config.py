@@ -3494,6 +3494,10 @@ def load_environment(args: argparse.Namespace) -> dict[str, str]:
         env["https_proxy"] = proxy
     if dnf := os.getenv("MKOSI_DNF"):
         env["MKOSI_DNF"] = dnf
+    # Amazon Linux doesn't work with dnf5 yet, see https://github.com/rpm-software-management/dnf5/issues/1321.
+    # TODO: Remove when the above bug is fixed in a new dnf5 release.
+    elif args.distribution == Distribution.amazon:
+        env["MKOSI_DNF"] = "dnf"
 
     env |= dict(parse_environment(line) for f in args.environment_files for line in f.read_text().strip().splitlines())
     env |= args.environment

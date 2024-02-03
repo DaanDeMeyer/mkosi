@@ -79,9 +79,9 @@ class Installer(DistributionInstaller):
         Dnf.createrepo(context)
 
     @classmethod
-    def setup(cls, context: Context) -> None:
+    def setup(cls, context: Context, *, dbpath: str = "/usr/lib/sysimage/rpm") -> None:
         Dnf.setup(context, cls.repositories(context), filelists=False)
-        setup_rpm(context)
+        setup_rpm(context, dbpath=dbpath)
 
     @classmethod
     def install(cls, context: Context) -> None:
